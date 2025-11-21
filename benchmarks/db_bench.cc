@@ -1123,7 +1123,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  leveldb::g_env = leveldb::Env::Default();
+  leveldb::g_env = leveldb::Env::Default(); // 相当于提供一些文件操作的接口, 这样的话可以文件的后端可以自定义进行实现
 
   // Choose a location for the test database if none given with --db=<path>
   if (FLAGS_db == nullptr) {

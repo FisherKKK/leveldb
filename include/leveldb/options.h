@@ -30,7 +30,7 @@ enum CompressionType {
   kZstdCompression = 0x2,
 };
 
-// Options to control the behavior of a database (passed to DB::Open)
+// Options to control the behavior of a database (passed to DB::Open), 全局的一些Option传递给DB
 struct LEVELDB_EXPORT Options {
   // Create an Options object with default values for all fields.
   Options();
@@ -44,7 +44,7 @@ struct LEVELDB_EXPORT Options {
   // REQUIRES: The client must ensure that the comparator supplied
   // here has the same name and orders keys *exactly* the same as the
   // comparator provided to previous open calls on the same DB.
-  const Comparator* comparator;
+  const Comparator* comparator; // 相当于是对Key进行对比的类
 
   // If true, the database will be created if it is missing.
   bool create_if_missing = false;

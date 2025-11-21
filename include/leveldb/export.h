@@ -5,6 +5,7 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_EXPORT_H_
 #define STORAGE_LEVELDB_INCLUDE_EXPORT_H_
 
+// 这里相当于是针对windows平台设置export
 #if !defined(LEVELDB_EXPORT)
 
 #if defined(LEVELDB_SHARED_LIBRARY)

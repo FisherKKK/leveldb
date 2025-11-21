@@ -1501,9 +1501,9 @@ DB::~DB() = default;
 
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
-
+  // 这里相当于是DB的具体实现, 继承自DB, DB相当于只是interface
   DBImpl* impl = new DBImpl(options, dbname);
-  impl->mutex_.Lock();
+  impl->mutex_.Lock(); // 对如下的操作需要锁住, 保证状态
   VersionEdit edit;
   // Recover handles create_if_missing, error_if_exists
   bool save_manifest = false;
