@@ -125,123 +125,560 @@ MaybeScheduleCompaction()
 后台线程执行CompactMemTable()
 ```
 
-### 2.2 CompactMemTable实现
+### 2.2 CompactMemTable详细流程
+
+#### 2.2.1 完整代码分析
 
 ```cpp
-// db/db_impl.cc, lines 766-823
+// db/db_impl.cc, lines 549-580
 void DBImpl::CompactMemTable() {
-  mutex_.AssertHeld();
-  assert(imm_ != nullptr);
+  mutex_.AssertHeld();  // 前置条件：必须持有互斥锁
+  assert(imm_ != nullptr);  // 确保有Immutable MemTable需要刷盘
 
-  // 保存imm_到Level-0
+  // ========== 阶段1：准备刷盘 ==========
+  // 创建VersionEdit记录本次变更
   VersionEdit edit;
-  Version* base = versions_->current();
-  base->Ref();
-  Status s = WriteLevel0Table(imm_, &edit, base);
-  base->Unref();
 
+  // 获取当前Version（快照）
+  Version* base = versions_->current();
+  base->Ref();  // 增加引用计数，防止被删除
+
+  // 核心调用：将Immutable MemTable写入SSTable
+  Status s = WriteLevel0Table(imm_, &edit, base);
+
+  base->Unref();  // 减少引用计数
+
+  // ========== 阶段2：检查关闭状态 ==========
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
     s = Status::IOError("Deleting DB during memtable compaction");
   }
 
-  // 应用版本变更
+  // ========== 阶段3：应用版本变更 ==========
   if (s.ok()) {
+    // 标记旧的WAL文件可以删除
     edit.SetPrevLogNumber(0);
     edit.SetLogNumber(logfile_number_);
+
+    // 写入MANIFEST并切换到新Version
     s = versions_->LogAndApply(&edit, &mutex_);
   }
 
+  // ========== 阶段4：清理与提交 ==========
   if (s.ok()) {
-    // 删除旧的WAL文件
-    DeleteObsoleteFiles();
-    // 清空imm_
+    // 成功：清理Immutable MemTable
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
+
+    // 删除旧文件（包括WAL）
+    RemoveObsoleteFiles();
   } else {
+    // 失败：记录错误
     RecordBackgroundError(s);
   }
 }
 ```
 
-### 2.3 WriteLevel0Table实现
+#### 2.2.2 执行流程图
+
+```
+CompactMemTable完整流程：
+
+线程: 后台Compaction线程
+状态: 持有mutex_
+
+┌─────────────────────────────────────────────┐
+│ 1. 检查状态                                │
+│    assert(imm_ != nullptr)                 │
+│    ✓ 有Immutable MemTable需要处理          │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│ 2. 准备刷盘                                │
+│    VersionEdit edit;                        │
+│    Version* base = versions_->current();    │
+│    base->Ref();  ← 保护当前Version          │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│ 3. WriteLevel0Table                         │
+│    ├─ 创建文件编号: 123                     │
+│    ├─ pending_outputs_.insert(123)         │
+│    ├─ mutex_.Unlock()                      │
+│    ├─ BuildTable(...)                      │
+│    │   ├─ 遍历MemTable                     │
+│    │   ├─ 写入SSTable                      │
+│    │   └─ fsync (持久化)                   │
+│    ├─ mutex_.Lock()                        │
+│    └─ pending_outputs_.erase(123)          │
+│    ✓ 生成 /tmp/db/000123.ldb (2MB)        │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│ 4. 应用版本变更                            │
+│    edit.SetLogNumber(logfile_number_);     │
+│    versions_->LogAndApply(&edit, &mutex_);  │
+│    ├─ 写入MANIFEST                         │
+│    │   add file 123 at level-0             │
+│    │   log_number: 456                     │
+│    ├─ fsync MANIFEST                       │
+│    ├─ 创建新Version                        │
+│    │   └─ files_[0].push_back(file_123)    │
+│    └─ current_ = new_version               │
+│    ✓ 数据库状态更新完成                    │
+└──────────────────┬──────────────────────────┘
+                   │
+┌──────────────────▼──────────────────────────┐
+│ 5. 清理工作                                │
+│    imm_->Unref();                           │
+│    imm_ = nullptr;                          │
+│    has_imm_.store(false);                   │
+│    RemoveObsoleteFiles();                   │
+│    ├─ 删除WAL: 000456.log                  │
+│    └─ 删除其他过期文件                     │
+│    ✓ 清理完成                              │
+└─────────────────────────────────────────────┘
+```
+
+#### 2.2.3 线程安全分析
+
+**问题：为什么CompactMemTable需要持锁？**
 
 ```cpp
-// db/db_impl.cc, lines 825-915
-Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
-                                 Version* base) {
+// 潜在竞争条件
+Thread1 (写入)           Thread2 (Compaction)
+    │                        │
+    │ db->Put(k, v)          │
+    │ ├─ 检查mem_            │
+    │ ├─ 写入mem_            │ CompactMemTable()
+    │ └─ 返回                │ ├─ imm_ = nullptr  ❌
+    │                        │ └─ imm_->Unref()  ❌
+    │                        │
+
+// 正确的加锁顺序
+Thread1 (写入)           Thread2 (Compaction)
+    │                        │
+    │ mutex_.Lock()          │ mutex_.Lock()
+    │ db->Put(k, v)          │ 等待...
+    │ ├─ 检查mem_            │  (阻塞)
+    │ ├─ 写入mem_            │
+    │ mutex_.Unlock()        │ ✓ 获得锁
+    │                        │ CompactMemTable()
+    │                        │ ├─ imm_ = nullptr  ✓
+    │                        │ └─ imm_->Unref()  ✓
+```
+
+**关键不变式：**
+
+```cpp
+// 不变式1：读写互斥
+mutex_.Lock()
+  // 要么读，要么写，不能同时
+  if (writing) {
+    // 前台写入操作
+  } else {
+    // Compaction操作
+  }
+mutex_.Unlock()
+
+// 不变式2：imm_的生命周期
+if (imm_ != nullptr) {
+  // imm_必须保持有效，直到：
+  // 1. WriteLevel0Table完成
+  // 2. LogAndApply完成
+  // 3. imm_ = nullptr
+}
+
+// 不变式3：Version切换的原子性
+current_->Ref();      // 增加引用
+WriteLevel0Table();   // 使用current_
+current_->Unref();    // 释放引用
+// 确保current_在使用期间不被删除
+```
+
+#### 2.2.4 WAL文件的清理
+
+```cpp
+// WAL文件生命周期：
+// 创建 → 活跃使用 → Immutable → 过期 → 删除
+
+写入阶段:
+┌──────────────────────────────────────┐
+│  WAL: 000123.log (活跃)              │
+│  ├─ 记录所有写入操作                 │
+│  └─ 用于崩溃恢复                     │
+└──────────────────────────────────────┘
+            │ MemTable满
+            ▼
+切换阶段:
+┌──────────────────────────────────────┐
+│  mem_  (新的活跃MemTable)            │
+│  imm_ (Immutable，准备刷盘)          │
+│                                      │
+│  WAL: 000123.log (可以删除)          │
+│  └─ 数据已在imm_中                   │
+└──────────────────────────────────────┘
+            │ CompactMemTable
+            ▼
+刷盘阶段:
+┌──────────────────────────────────────┐
+│  imm_ → SSTable: 000456.ldb          │
+│                                      │
+│  edit.SetLogNumber(456);             │
+│  └─ 标记000456.log之前都过期         │
+└──────────────────────────────────────┘
+            │ RemoveObsoleteFiles
+            ▼
+清理阶段:
+┌──────────────────────────────────────┐
+│  删除: 000123.log                    │
+│  删除: 其他旧.log文件                │
+│                                      │
+│  当前WAL: 000456.log (活跃)          │
+└──────────────────────────────────────┘
+```
+
+**代码实现：**
+
+```cpp
+// db/filename.cc
+// WAL文件命名规则: {log_number}.log
+// 例如: 000123.log, 000456.log
+
+// db/version_set.cc:LogAndApply
+Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
+  // ...
+  if (edit->has_log_number_) {
+    // 记录新的log_number
+    // 之前的WAL文件（log_number更小的）都可以删除了
+    log_number_ = edit->log_number_;
+  }
+
+  // 写入MANIFEST
+  manifest_log_->AddRecord(edit->EncodeTo());
+  manifest_file_->Sync();
+
+  // 应用到当前Version
+  builder->Apply(edit);
+  // ...
+}
+
+// db/db_impl.cc:RemoveObsoleteFiles
+void DBImpl::RemoveObsoleteFiles() {
+  // 遍历数据库目录
+  std::vector<std::string> filenames;
+  env_->GetChildren(dbname_, &filenames);
+
+  for (const auto& filename : filenames) {
+    uint64_t number;
+    FileType type;
+    if (!ParseFileName(filename, &number, &type)) {
+      continue;
+    }
+
+    // 删除过期的WAL文件
+    if (type == kLogFile) {
+      if (number >= log_number_) {
+        // 当前或未来的WAL，不能删除
+        continue;
+      }
+      // 删除旧的WAL
+      env_->DeleteFile(dbname_ + "/" + filename);
+    }
+  }
+}
+```
+
+#### 2.2.5 错误处理
+
+```cpp
+// CompactMemTable的错误处理策略
+
+if (s.ok()) {
+  // 成功路径
+  imm_->Unref();
+  imm_ = nullptr;
+  has_imm_.store(false, std::memory_order_release);
+  RemoveObsoleteFiles();
+} else {
+  // 失败路径
+  RecordBackgroundError(s);
+  // 注意：imm_仍然存在！
+  // 下次Compaction会重试
+}
+
+// 错误类型：
+// 1. IOError: 磁盘满
+//    → imm_保留，等待重试
+// 2. Corruption: SSTable损坏
+//    → imm_保留，等待重试
+// 3. Shutdown: 数据库关闭
+//    → 取消Compaction
+
+// db/db_impl.cc:RecordBackgroundError
+void DBImpl::RecordBackgroundError(const Status& s) {
   mutex_.AssertHeld();
+  if (bg_error_.ok()) {
+    // 只记录第一个错误
+    bg_error_ = s;
+    // 通知所有等待的线程
+    background_work_finished_signal_.SignalAll();
+  }
+}
+
+// 前台操作检查错误
+Status DBImpl::Put(const WriteOptions& options, const Slice& key,
+                   const Slice& value) {
+  // ...
+  {
+    MutexLock l(&mutex_);
+    if (!bg_error_.ok()) {
+      // 后台有错误，前台写入失败
+      return bg_error_;
+    }
+    // 正常写入流程
+  }
+}
+```
+
+### 2.3 WriteLevel0Table深度分析
+
+#### 2.3.1 完整代码逐行解析
+
+```cpp
+// db/db_impl.cc, lines 505-547
+Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
+                                Version* base) {
+  // ========== 阶段1：准备工作 ==========
+  mutex_.AssertHeld();  // 确保持有互斥锁
+
+  // 记录开始时间（用于性能统计）
   const uint64_t start_micros = env_->NowMicros();
+
+  // 创建文件元数据
   FileMetaData meta;
-  meta.number = versions_->NewFileNumber();
+  meta.number = versions_->NewFileNumber();  // 分配文件编号
+
+  // 关键：将文件编号加入pending_outputs_
+  // 防止在文件完全写入前被删除
   pending_outputs_.insert(meta.number);
+
+  // 创建MemTable迭代器（用于遍历所有键值对）
   Iterator* iter = mem->NewIterator();
+
+  // 记录日志
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
 
+  // ========== 阶段2：构建SSTable（关键区） ==========
   Status s;
   {
-    mutex_.Unlock();
+    mutex_.Unlock();  // ⚠️ 释放锁，允许其他线程操作数据库
+
+    // 核心调用：将MemTable内容写入SSTable
+    // db/builder.cc:BuildTable
     s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
-    mutex_.Lock();
+
+    mutex_.Lock();    // ⚠️ 重新获取锁
   }
 
+  // ========== 阶段3：完成处理 ==========
+  // 记录完成日志
   Log(options_.info_log, "Level-0 table #%llu: %lld bytes %s",
-      (unsigned long long)meta.number, (unsigned long long)meta.file_size,
+      (unsigned long long)meta.number,
+      (unsigned long long)meta.file_size,
       s.ToString().c_str());
+
+  // 清理迭代器
   delete iter;
+
+  // 从pending集合中移除（文件现在可以被安全删除）
   pending_outputs_.erase(meta.number);
 
-  // 选择合适的层级
+  // ========== 阶段4：选择目标层级 ==========
   int level = 0;
   if (s.ok() && meta.file_size > 0) {
+    // 获取键范围
     const Slice min_user_key = meta.smallest.user_key();
     const Slice max_user_key = meta.largest.user_key();
+
+    // 智能选择：可能跳过Level-0直接写到Level-2
     if (base != nullptr) {
       level = base->PickLevelForMemTableOutput(min_user_key, max_user_key);
     }
-    edit->AddFile(level, meta.number, meta.file_size, meta.smallest,
-                  meta.largest);
+
+    // 添加到VersionEdit（记录这次变更）
+    edit->AddFile(level, meta.number, meta.file_size,
+                  meta.smallest, meta.largest);
   }
 
+  // ========== 阶段5：统计信息 ==========
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
+
   return s;
 }
 ```
 
-**BuildTable实现：**
+#### 2.3.2 内存布局分析
+
+```
+WriteLevel0Table内存布局：
+
+┌─────────────────────────────────────────────┐
+│  DBImpl::WriteLevel0Table 栈帧              │
+├─────────────────────────────────────────────┤
+│  FileMetaData meta (栈上)                   │
+│  ├─ number: 123                             │
+│  ├─ file_size: 0 (初始)                    │
+│  └─ smallest/largest: InternalKey           │
+├─────────────────────────────────────────────┤
+│  Iterator* iter (堆上)                      │
+│  └─ 指向 MemTable的SkipList                 │
+├─────────────────────────────────────────────┤
+│  pending_outputs_ (全局集合)                │
+│  └─ {123} ← 防止删除                        │
+└─────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────┐
+│  BuildTable 调用                            │
+├─────────────────────────────────────────────┤
+│  WritableFile* file                         │
+│  └─ fd: /tmp/db/123.ldb                     │
+├─────────────────────────────────────────────┤
+│  TableBuilder* builder                      │
+│  ├─ buffer: std::string (4KB block)        │
+│  └─ 压缩器                                  │
+└─────────────────────────────────────────────┘
+```
+
+#### 2.3.3 关键设计点
+
+**设计点1：锁的释放与获取**
 
 ```cpp
-// db/builder.cc, lines 25-95
+{
+  mutex_.Unlock();
+  s = BuildTable(dbname_, env_, options_, table_cache_, iter, &meta);
+  mutex_.Lock();
+}
+```
+
+**为什么需要释放锁？**
+
+```
+不释放锁的问题：
+┌──────────────┐        ┌──────────────┐
+│ Compaction   │        │  前台写入    │
+│  Thread      │        │   Thread     │
+└──────┬───────┘        └──────┬───────┘
+       │ 持有mutex_              │ 等待mutex_
+       │ BuildTable...           │ (阻塞!)
+       │ 50-100ms                │
+       │                         │ ❌ 写入延迟
+
+释放锁的好处：
+┌──────────────┐        ┌──────────────┐
+│ Compaction   │        │  前台写入    │
+│  Thread      │        │   Thread     │
+└──────┬───────┘        └──────┬───────┘
+       │ 释放mutex_             │ 获取mutex_
+       │ BuildTable...          │ 继续写入 ✓
+       │ 50-100ms               │
+       │ 重新获取mutex_         │
+       │                         │ ✅ 并发执行
+```
+
+**设计点2：pending_outputs_的作用**
+
+```cpp
+pending_outputs_.insert(meta.number);  // 写入前
+// ... BuildTable ...
+pending_outputs_.erase(meta.number);   // 写入后
+```
+
+**防止文件被误删除：**
+
+```cpp
+// db/db_impl.cc:DeleteObsoleteFiles
+void DBImpl::DeleteObsoleteFiles() {
+  // ... 遍历需要删除的文件
+  if (pending_outputs_.count(file_number) > 0) {
+    // 文件正在写入，跳过删除！
+    continue;
+  }
+  // 安全删除
+  env_->DeleteFile(file_name);
+}
+```
+
+**时序图：**
+
+```
+T1: WriteLevel0Table开始
+    pending_outputs_.insert(123)
+    └─> 文件123被标记为"写入中"
+
+T2: 另一个线程调用DeleteObsoleteFiles()
+    检查: pending_outputs_.count(123) > 0
+    └─> 跳过删除123.ldb
+
+T3: BuildTable完成
+    pending_outputs_.erase(123)
+    └─> 文件123可以被删除了
+
+T4: 下次DeleteObsoleteFiles()
+    检查: pending_outputs_.count(123) == 0
+    └─> 可以删除123.ldb
+```
+
+#### 2.3.4 BuildTable深度解析
+
+```cpp
+// db/builder.cc, lines 17-80
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
   Status s;
-  meta->file_size = 0;
-  iter->SeekToFirst();
+  meta->file_size = 0;  // 初始化文件大小
 
+  // ========== 步骤1：准备迭代器 ==========
+  iter->SeekToFirst();  // 定位到第一个键值对
+
+  // ========== 步骤2：创建文件 ==========
   std::string fname = TableFileName(dbname, meta->number);
-  if (iter->Valid()) {
+  // 例如: /tmp/db/000123.ldb
+
+  if (iter->Valid()) {  // MemTable不为空
+    // 创建可写文件
     WritableFile* file;
     s = env->NewWritableFile(fname, &file);
     if (!s.ok()) {
-      return s;
+      return s;  // 创建失败
     }
 
+    // ========== 步骤3：构建SSTable ==========
     TableBuilder* builder = new TableBuilder(options, file);
+
+    // 记录最小键（第一个键）
     meta->smallest.DecodeFrom(iter->key());
+
     Slice key;
+    // 遍历所有键值对
     for (; iter->Valid(); iter->Next()) {
       key = iter->key();
-      builder->Add(key, iter->value());
+      builder->Add(key, iter->value());  // 添加到builder
     }
+
+    // 记录最大键（最后一个键）
     if (!key.empty()) {
       meta->largest.DecodeFrom(key);
     }
 
-    // 完成构建
+    // ========== 步骤4：完成构建 ==========
+    // Flush所有buffer，写入索引块和Footer
     s = builder->Finish();
     if (s.ok()) {
       meta->file_size = builder->FileSize();
@@ -249,36 +686,161 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     }
     delete builder;
 
-    // 确保写入磁盘
+    // ========== 步骤5：同步到磁盘 ==========
     if (s.ok()) {
-      s = file->Sync();
+      s = file->Sync();   // ⚠️ fsync确保数据持久化
     }
     if (s.ok()) {
-      s = file->Close();
+      s = file->Close();  // 关闭文件
     }
     delete file;
+    file = nullptr;
 
+    // ========== 步骤6：验证SSTable ==========
     if (s.ok()) {
-      // 验证SSTable
-      Iterator* it = table_cache->NewIterator(ReadOptions(), meta->number,
-                                               meta->file_size);
+      // 打开刚创建的SSTable，验证可读性
+      Iterator* it = table_cache->NewIterator(
+          ReadOptions(), meta->number, meta->file_size);
       s = it->status();
       delete it;
     }
   }
 
-  // 检查输入迭代器
+  // ========== 步骤7：错误处理 ==========
   if (!iter->status().ok()) {
     s = iter->status();
   }
 
+  // 如果失败，删除不完整的文件
   if (s.ok() && meta->file_size > 0) {
     // 保留文件
   } else {
     env->RemoveFile(fname);
   }
+
   return s;
 }
+```
+
+**BuildTable数据流：**
+
+```
+MemTable (SkipList)
+    │
+    │ Iterator
+    ▼
+┌─────────────────────────────────┐
+│  TableBuilder                   │
+├─────────────────────────────────┤
+│  Data Block 1 (4KB)             │
+│  ├─ key1: value1                │
+│  ├─ key2: value2                │
+│  └─ ...                         │
+├─────────────────────────────────┤
+│  Data Block 2 (4KB)             │
+│  ├─ ...                         │
+├─────────────────────────────────┤
+│  ...                            │
+├─────────────────────────────────┤
+│  Filter Block (Bloom Filter)    │
+├─────────────────────────────────┤
+│  Index Block                    │
+│  ├─ Block1: offset, size        │
+│  ├─ Block2: offset, size        │
+│  └─ ...                         │
+├─────────────────────────────────┤
+│  Footer (48 bytes)              │
+└─────────────────────────────────┘
+    │
+    │ WriteableFile
+    ▼
+/tmp/db/000123.ldb
+```
+
+#### 2.3.5 TableBuilder工作原理
+
+```cpp
+// table/table_builder.cc (简化版)
+class TableBuilder {
+ public:
+  void Add(const Slice& key, const Slice& value) {
+    // 1. 检查是否需要重启Block
+    if (block_builder_.FileSize() >= options_.block_size) {
+      Flush();  // 当前Block满，写入文件
+    }
+
+    // 2. 添加到当前Block（前缀压缩）
+    block_builder_.Add(key, value);
+
+    // 3. 更新过滤器
+    if (filter_policy_) {
+      filter_block_.Add(key);
+    }
+  }
+
+  Status Finish() {
+    // 1. Flush最后一个Data Block
+    if (!block_buffer_.empty()) {
+      Flush();
+    }
+
+    // 2. 写入Filter Block
+    WriteFilterBlock();
+
+    // 3. 写入Index Block
+    WriteIndexBlock();
+
+    // 4. 写入Footer
+    WriteFooter();
+
+    return status_;
+  }
+
+ private:
+  void Flush() {
+    // 压缩Block
+    std::string compressed;
+    if (compressor_) {
+      compressor_->Compress(block_buffer_, &compressed);
+    } else {
+      compressed = block_buffer_;
+    }
+
+    // 写入文件
+    file_->Append(compressed);
+
+    // 记录到Index
+    index_block_.Add(last_key, offset, size);
+
+    // 清空buffer
+    block_buffer_.clear();
+  }
+};
+```
+
+**前缀压缩示例：**
+
+```
+原始键值：
+  user:001 → "Alice"
+  user:002 → "Bob"
+  user:003 → "Charlie"
+
+不压缩（每个键完整存储）：
+  [12字节"user:001"] [5字节"Alice"]
+  [12字节"user:002"] [3字节"Bob"]
+  [12字节"user:003"] [9字节"Charlie"]
+  总计: 53字节
+
+前缀压缩（只存储差异）：
+  [12字节"user:001"] [5字节"Alice"]
+  [3字节"002"] [3字节"Bob"]         ← 共享前缀"user:00"
+  [3字节"003"] [9字节"Charlie"]
+  总计: 37字节 (节省30%)
+
+压缩算法：
+  1. 计算当前key与上一次key的公共前缀长度
+  2. 存储: [共享长度][非共享长度][非共享部分][value]
 ```
 
 ### 2.4 PickLevelForMemTableOutput
